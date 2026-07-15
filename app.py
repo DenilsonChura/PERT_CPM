@@ -841,6 +841,27 @@ def init_state():
         ss.actividades = plantilla_df("subterranea")
     if "avance" not in ss:
         ss.avance = {}
+    # Nonce del editor: al cambiar, Streamlit reconstruye el Data Editor desde cero.
+    # Necesario al reemplazar el dataset (plantillas / importación), de lo contrario
+    # el editor reaplica ediciones antiguas sobre los datos nuevos.
+    if "_editor_nonce" not in ss:
+        ss._editor_nonce = 0
+    # Firma del último archivo importado: evita reimportar en cada recarga.
+    if "_ultimo_import" not in ss:
+        ss._ultimo_import = None
+
+
+def _bump_editor():
+    """Fuerza la reconstrucción del Data Editor tras reemplazar el dataset."""
+    st.session_state._editor_nonce = st.session_state.get("_editor_nonce", 0) + 1
+
+
+def cargar_plantilla(tipo: str, etiqueta: str):
+    """Carga una plantilla interna y resetea el estado dependiente."""
+    set_actividades(plantilla_df(tipo))
+    st.session_state.config["tipo"] = etiqueta
+    st.session_state.avance = {}
+    _bump_editor()
 
 
 def get_actividades() -> pd.DataFrame:
@@ -939,15 +960,18 @@ mediante las metodologías **PERT** y **CPM**.
         kpi_card(c4, "Actividades críticas", "—")
 
     st.divider(); st.subheader("Comenzar rápido")
+
+    st.markdown("**Opción A — plantillas incluidas**")
     col1, col2 = st.columns(2)
     if col1.button("🏗️ Cargar plantilla — Subterránea", use_container_width=True):
-        set_actividades(plantilla_df("subterranea"))
-        st.session_state.config["tipo"] = "Subterránea"
+        cargar_plantilla("subterranea", "Subterránea")
         st.success("Plantilla subterránea cargada."); st.rerun()
     if col2.button("🚜 Cargar plantilla — Superficial", use_container_width=True):
-        set_actividades(plantilla_df("superficial"))
-        st.session_state.config["tipo"] = "Superficial"
+        cargar_plantilla("superficial", "Superficial")
         st.success("Plantilla superficial cargada."); st.rerun()
+
+    st.markdown("**Opción B — subir su propia plantilla (.xlsx)**")
+    widget_importar("inicio")
 
 
 def vista_configuracion():
@@ -996,6 +1020,56 @@ def _mapear_columnas(df: pd.DataFrame) -> pd.DataFrame:
     return df[COLUMNAS]
 
 
+def widget_importar(contexto: str) -> bool:
+    """Cargador de plantillas .xlsx reutilizable.
+
+    Importa el archivo UNA sola vez. El file_uploader de Streamlit sigue
+    devolviendo el archivo en cada recarga del script, por lo que se compara una
+    firma (nombre + tamaño) contra la última importación para no reimportar en
+    bucle. No llama a st.rerun(): el Data Editor se reconstruye mediante el nonce.
+    """
+    st.markdown("##### 📥 Importar plantilla desde Excel")
+    st.caption("Columnas esperadas: ID · Actividad · Predecesoras · Optimista · "
+               "Mas_probable · Pesimista · Duracion_CPM · Costo · Recursos")
+    archivo = st.file_uploader(
+        "Archivo .xlsx", type=["xlsx"], key=f"uploader_{contexto}",
+        label_visibility="collapsed")
+
+    if archivo is None:
+        return False
+
+    firma = f"{archivo.name}|{archivo.size}"
+    if st.session_state.get("_ultimo_import") == firma:
+        st.caption(f"✔️ **{archivo.name}** ya está cargado "
+                   f"({len(get_actividades())} actividades). "
+                   "Pulse la ✕ del archivo para subir otro.")
+        return False
+
+    try:
+        imp = _mapear_columnas(pd.read_excel(archivo))
+    except Exception as e:
+        st.error(f"No se pudo leer el archivo: {e}")
+        return False
+
+    if imp.empty or imp[COL_ID].astype(str).str.strip().eq("").all():
+        st.error("El archivo no contiene actividades legibles. "
+                 "Verifique que la primera fila sean los encabezados.")
+        return False
+
+    set_actividades(imp)
+    st.session_state._ultimo_import = firma
+    st.session_state.avance = {}
+    _bump_editor()
+    st.success(f"✅ Importadas **{len(imp)}** actividades desde **{archivo.name}**.")
+
+    errores = validar(imp)
+    if errores:
+        st.warning("Se importó, pero revise estas observaciones:")
+        for e in errores[:5]:
+            st.markdown(f"- {e}")
+    return True
+
+
 def vista_actividades():
     cabecera("📋 Registro de actividades",
              "Agregue, edite o elimine actividades y sus predecesoras")
@@ -1005,24 +1079,16 @@ def vista_actividades():
         nuevo_id = _siguiente_id(df)
         fila = {c: (nuevo_id if c == COL_ID else (0 if c in (COL_O, COL_M, COL_P, COL_DUR, COL_COSTO) else ""))
                 for c in COLUMNAS}
-        set_actividades(pd.concat([df, pd.DataFrame([fila])], ignore_index=True)); st.rerun()
+        set_actividades(pd.concat([df, pd.DataFrame([fila])], ignore_index=True))
+        _bump_editor(); st.rerun()
     if c2.button("🏗️ Plantilla subterránea", use_container_width=True):
-        set_actividades(plantilla_df("subterranea")); st.rerun()
+        cargar_plantilla("subterranea", "Subterránea"); st.rerun()
     if c3.button("🚜 Plantilla superficial", use_container_width=True):
-        set_actividades(plantilla_df("superficial")); st.rerun()
+        cargar_plantilla("superficial", "Superficial"); st.rerun()
     if c4.button("🗑️ Vaciar tabla", use_container_width=True):
-        set_actividades(df_vacio()); st.rerun()
+        set_actividades(df_vacio()); _bump_editor(); st.rerun()
 
-    st.markdown("##### Importar desde Excel")
-    archivo = st.file_uploader("Archivo .xlsx con las columnas estándar", type=["xlsx"],
-                               label_visibility="collapsed")
-    if archivo is not None:
-        try:
-            imp = _mapear_columnas(pd.read_excel(archivo))
-            set_actividades(imp)
-            st.success(f"Importadas {len(imp)} actividades."); st.rerun()
-        except Exception as e:
-            st.error(f"No se pudo importar: {e}")
+    widget_importar("registro")
 
     st.divider()
     df = get_actividades().copy()
@@ -1043,7 +1109,8 @@ def vista_actividades():
         COL_REC: st.column_config.TextColumn("Recursos"),
     }
     editado = st.data_editor(df[COLUMNAS], num_rows="dynamic", use_container_width=True,
-                             column_config=config_cols, key="editor_actividades", height=420)
+                             column_config=config_cols, height=420,
+                             key=f"editor_actividades_{st.session_state.get('_editor_nonce', 0)}")
     set_actividades(editado)
 
     errores = validar(editado)
@@ -1311,8 +1378,7 @@ def vista_subterranea():
     for i, l in enumerate(labores):
         cols[i % 3].markdown(f"- **{l}**")
     if st.button("📥 Cargar plantilla de actividades subterránea", type="primary"):
-        set_actividades(plantilla_df("subterranea"))
-        st.session_state.config["tipo"] = "Subterránea"
+        cargar_plantilla("subterranea", "Subterránea")
         st.success("Plantilla cargada. Vaya a **Análisis CPM** para ver resultados.")
 
     st.divider()
@@ -1349,8 +1415,7 @@ def vista_superficial():
     for i, o in enumerate(ops):
         cols[i % 4].markdown(f"- **{o}**")
     if st.button("📥 Cargar plantilla de actividades superficial", type="primary"):
-        set_actividades(plantilla_df("superficial"))
-        st.session_state.config["tipo"] = "Superficial"
+        cargar_plantilla("superficial", "Superficial")
         st.success("Plantilla cargada. Vaya a **Análisis CPM** para ver resultados.")
 
     st.divider()
